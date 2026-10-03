@@ -56,8 +56,8 @@ training:
   weight_decay: 0.01
   warmup_ratio: 0.1
   optim: "paged_adamw_32bit"
-  bf16: true
-  fp16: false
+  bf16: false   # T4 lacks native BF16 — use FP16 for Tensor Core acceleration
+  fp16: true
 
   eval_strategy: "steps"
   eval_steps: 100
