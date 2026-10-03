@@ -98,8 +98,8 @@ def main():
     # Load processor with conservative image resolution limits to speed up attention
     processor = AutoProcessor.from_pretrained(
         model_id,
-        min_pixels=256 * 28 * 28,
-        max_pixels=256 * 28 * 28
+        min_pixels=128 * 28 * 28,
+        max_pixels=128 * 28 * 28
     )
 
     # Note: for CPU smoke test, we'll skip loading the massive model if not possible, but since we catch CUDA early, this is fine
@@ -246,6 +246,9 @@ def main():
         greater_is_better=train_cfg.get("greater_is_better", False),
         load_best_model_at_end=train_cfg.get("load_best_model_at_end", True),
         dataloader_num_workers=2,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=True,
+        dataloader_prefetch_factor=2,
     )
 
     if torch.cuda.is_available():
