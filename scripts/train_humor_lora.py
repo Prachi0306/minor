@@ -319,21 +319,35 @@ def main():
             callbacks=[EarlyStoppingCallback(early_stopping_patience=train_cfg.get("early_stopping_patience", 5))] if not args.smoke_test else [],
         )
 
-        # ── ONE-BATCH MANUAL GRADIENT DIAGNOSTIC ──
+        # ── EXHAUSTIVE OPTIMIZER & GRADIENT DIAGNOSTIC ──
         if args.smoke_test and torch.cuda.is_available():
-            logger.info("=" * 60)
-            logger.info("MANUAL FORWARD/BACKWARD DIAGNOSTIC")
-            logger.info("=" * 60)
+            logger.info("=" * 80)
+            logger.info("EXHAUSTIVE OPTIMIZER & GRADIENT DIAGNOSTIC (PRE-TRAIN)")
+            logger.info("=" * 80)
+            
             try:
+                # 1. Create optimizer exactly as Trainer would
+                trainer.create_optimizer()
+                
+                # 2. Get one real batch
                 collator = QwenVLDataCollator(processor)
                 sample_batch = collator([train_ds[0]])
-                
-                # Move to device
                 for k, v in sample_batch.items():
                     if isinstance(v, torch.Tensor):
                         sample_batch[k] = v.to(model.device)
                 
-                # Context manager based on training args
+                # 3. Print environment settings
+                logger.info(f"accelerator.mixed_precision: {trainer.accelerator.mixed_precision}")
+                logger.info(f"trainer.args.fp16: {trainer.args.fp16}")
+                logger.info(f"trainer.args.bf16: {trainer.args.bf16}")
+                logger.info(f"scaler class: {trainer.scaler.__class__.__name__ if trainer.scaler else 'None'}")
+                logger.info(f"bnb_4bit_compute_dtype: {bnb_config.bnb_4bit_compute_dtype if bnb_config else 'None'}")
+                if hasattr(torch, 'get_autocast_gpu_dtype'):
+                    logger.info(f"torch.get_autocast_gpu_dtype(): {torch.get_autocast_gpu_dtype()}")
+                
+                # 4. Run exact forward and backward pass
+                model.train()
+                
                 if sft_config.fp16:
                     ctx = torch.autocast(device_type='cuda', dtype=torch.float16)
                 elif sft_config.bf16:
@@ -343,29 +357,77 @@ def main():
                     ctx = nullcontext()
 
                 with ctx:
-                    outputs = model(**sample_batch)
-                    # We just need any scalar loss to backward
-                    loss = outputs.logits.sum()
-
+                    loss = trainer.compute_loss(model, sample_batch)
+                
                 loss.backward()
 
-                grad_dtypes = Counter()
-                for name, param in model.named_parameters():
-                    if param.requires_grad and param.grad is not None:
-                        grad_dtypes[str(param.grad.dtype)] += 1
-                        if param.grad.dtype == torch.bfloat16:
-                            logger.error(f"BF16 Gradient found in: {name}, param dtype: {param.dtype}, shape: {param.shape}")
+                # 5. Inspect EVERY parameter in optimizer
+                logger.info("-" * 40)
+                logger.info("OPTIMIZER PARAMETER INSPECTION")
+                logger.info("-" * 40)
                 
-                logger.info(f"Gradient dtype counts across trainable params: {dict(grad_dtypes)}")
-                logger.info("Manual pass complete.")
+                opt_param_dtypes = Counter()
+                opt_grad_dtypes = Counter()
+                combo_counts = Counter()
+                
+                logger.info(f"Optimizer class: {trainer.optimizer.__class__.__name__}")
+                logger.info(f"Number of parameter groups: {len(trainer.optimizer.param_groups)}")
+                
+                # We need a mapping from param object to name to print names
+                param_to_name = {p: n for n, p in model.named_parameters()}
+                
+                first_bf16_grad = None
+
+                for i, group in enumerate(trainer.optimizer.param_groups):
+                    logger.info(f"Group {i} size: {len(group['params'])}")
+                    for p in group["params"]:
+                        name = param_to_name.get(p, "UNKNOWN_PARAM")
+                        
+                        p_dtype = str(p.dtype)
+                        opt_param_dtypes[p_dtype] += 1
+                        
+                        if not p.requires_grad:
+                            logger.error(f"Optimizer contains parameter with requires_grad=False: {name}")
+                        
+                        is_lora = "lora" in name.lower()
+                        is_4bit = "Params4bit" in p.__class__.__name__ or "NF4" in p.__class__.__name__
+                        
+                        if is_4bit:
+                            logger.error(f"Optimizer contains 4-bit parameter: {name}")
+
+                        if p.grad is not None:
+                            g_dtype = str(p.grad.dtype)
+                            opt_grad_dtypes[g_dtype] += 1
+                            combo_counts[f"{p_dtype} parameter + {g_dtype} gradient"] += 1
+                            
+                            if p.grad.dtype == torch.bfloat16:
+                                if first_bf16_grad is None:
+                                    first_bf16_grad = name
+                                logger.error(f"BF16 GRADIENT -> Name: {name}, Param Dtype: {p_dtype}, Grad Shape: {p.grad.shape}, Is LoRA: {is_lora}, Is 4bit: {is_4bit}")
+                        else:
+                            logger.warning(f"Parameter in optimizer has NO gradient: {name}")
+
+                logger.info("-" * 40)
+                logger.info("AGGREGATED COUNTS")
+                logger.info("-" * 40)
+                logger.info(f"Optimizer parameter dtypes: {dict(opt_param_dtypes)}")
+                logger.info(f"Optimizer gradient dtypes: {dict(opt_grad_dtypes)}")
+                for combo, count in combo_counts.items():
+                    logger.info(f"{combo}: {count}")
+                
+                if first_bf16_grad:
+                    logger.error(f"FIRST PARAMETER WITH BF16 GRADIENT: {first_bf16_grad}")
+                else:
+                    logger.info("NO BF16 GRADIENTS FOUND IN OPTIMIZER.")
                 
                 # Clear gradients so we don't mess up actual training
                 model.zero_grad()
+                trainer.optimizer.zero_grad()
                 
             except Exception as e:
-                logger.error(f"Manual pass failed: {e}")
+                logger.error(f"Exhaustive diagnostic failed: {e}", exc_info=True)
                 
-            logger.info("=" * 60)
+            logger.info("=" * 80)
 
         logger.info("Starting training...")
         
