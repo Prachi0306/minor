@@ -95,11 +95,11 @@ def main():
     else:
         bnb_config = None
 
-    # Load processor with conservative image resolution limits for 15GB T4 GPU
+    # Load processor with conservative image resolution limits to speed up attention
     processor = AutoProcessor.from_pretrained(
         model_id,
         min_pixels=256 * 28 * 28,
-        max_pixels=512 * 28 * 28
+        max_pixels=256 * 28 * 28
     )
 
     # Note: for CPU smoke test, we'll skip loading the massive model if not possible, but since we catch CUDA early, this is fine
@@ -109,6 +109,7 @@ def main():
             quantization_config=bnb_config,
             device_map="auto",
             low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
         )
         if config["model"].get("gradient_checkpointing", True):
             model.gradient_checkpointing_enable()
@@ -244,6 +245,7 @@ def main():
         metric_for_best_model=train_cfg.get("metric_for_best_model", "eval_loss"),
         greater_is_better=train_cfg.get("greater_is_better", False),
         load_best_model_at_end=train_cfg.get("load_best_model_at_end", True),
+        dataloader_num_workers=2,
     )
 
     if torch.cuda.is_available():
