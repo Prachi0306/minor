@@ -95,8 +95,12 @@ def main():
     else:
         bnb_config = None
 
-    # Load processor
-    processor = AutoProcessor.from_pretrained(model_id)
+    # Load processor with conservative image resolution limits for 15GB T4 GPU
+    processor = AutoProcessor.from_pretrained(
+        model_id,
+        min_pixels=256 * 28 * 28,
+        max_pixels=512 * 28 * 28
+    )
 
     # Note: for CPU smoke test, we'll skip loading the massive model if not possible, but since we catch CUDA early, this is fine
     if torch.cuda.is_available():
