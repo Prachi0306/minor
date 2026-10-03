@@ -107,6 +107,7 @@ def main():
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_id,
             quantization_config=bnb_config,
+            torch_dtype=torch.float16,
             device_map="auto",
             low_cpu_mem_usage=True,
             attn_implementation="sdpa",
@@ -126,6 +127,16 @@ def main():
             task_type=lora_cfg["task_type"],
         )
         model = get_peft_model(model, lora_config)
+
+        # ── Dtype Diagnostic ──
+        trainable_dtypes = set()
+        total_trainable = 0
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                trainable_dtypes.add(str(param.dtype))
+                total_trainable += param.numel()
+        logger.info(f"Trainable parameters: {total_trainable:,}")
+        logger.info(f"Trainable parameter dtypes: {trainable_dtypes}")
     else:
         # Mock model for syntax testing
         model = None
