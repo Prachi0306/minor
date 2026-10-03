@@ -221,7 +221,7 @@ def main():
         save_steps=train_cfg["save_steps"],
         save_total_limit=train_cfg.get("save_total_limit", 3),
         logging_steps=train_cfg["logging_steps"],
-        max_seq_length=config["dataset"]["max_seq_length"],
+        max_length=config["dataset"]["max_seq_length"],
         seed=train_cfg["seed"],
         remove_unused_columns=False,
         dataset_text_field="ocr_text", # Ignored by our custom collator, but required by SFTConfig
