@@ -175,9 +175,6 @@ def main():
     class WeightedTrainer(SFTTrainer):
         def __init__(self, class_weights, processor_vocab, pad_token_id, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            # Find the token IDs for HUMOR and NON-HUMOR
-            # Qwen uses specific tokens. We will weight them directly.
-            self.vocab_size = len(processor_vocab)
             self.weight_tensor = None
             self.class_weights = class_weights
             self.processor_vocab = processor_vocab
@@ -187,24 +184,29 @@ def main():
             labels = inputs.pop("labels")
             outputs = model(**inputs)
             logits = outputs.get("logits")
-            
-            if self.weight_tensor is None:
-                # Initialize weights once on the correct device
-                self.weight_tensor = torch.ones(self.vocab_size, dtype=logits.dtype, device=logits.device)
-                humor_id = self.processor_vocab.get("HUMOR", None)  # Example, might need subword handling
+
+            # Derive actual vocab dimension from the model's logits, NOT from
+            # tokenizer dict length.  Qwen2.5-VL pads its LM-head embedding
+            # (e.g. 151936) beyond the tokenizer vocabulary (e.g. 151665).
+            actual_vocab_size = logits.size(-1)
+
+            if self.weight_tensor is None or self.weight_tensor.size(0) != actual_vocab_size:
+                # Build weight tensor matching the true logits dimension
+                self.weight_tensor = torch.ones(actual_vocab_size, dtype=logits.dtype, device=logits.device)
+                humor_id = self.processor_vocab.get("HUMOR", None)
                 non_humor_id = self.processor_vocab.get("NON", None)
-                if humor_id is not None:
+                if humor_id is not None and humor_id < actual_vocab_size:
                     self.weight_tensor[humor_id] = self.class_weights.get("HUMOR", 1.0)
-                if non_humor_id is not None:
+                if non_humor_id is not None and non_humor_id < actual_vocab_size:
                     self.weight_tensor[non_humor_id] = self.class_weights.get("NON-HUMOR", 1.0)
 
             # Shift logits
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            
+
             loss_fct = nn.CrossEntropyLoss(weight=self.weight_tensor, ignore_index=self.pad_token_id)
-            loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
-            
+            loss = loss_fct(shift_logits.view(-1, actual_vocab_size), shift_labels.view(-1))
+
             return (loss, outputs) if return_outputs else loss
 
     train_cfg = config["training"]
