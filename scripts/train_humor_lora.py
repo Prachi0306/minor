@@ -127,16 +127,57 @@ def main():
             task_type=lora_cfg["task_type"],
         )
         model = get_peft_model(model, lora_config)
+        # ── Comprehensive Dtype Diagnostic & Fix ──
+        # PEFT/BnB may create LoRA adapters in BF16 (from model config default)
+        # even when torch_dtype=float16 is passed. The FP16 GradScaler requires
+        # all trainable gradients to be FP16 or FP32 — BF16 is not supported.
+        logger.info("=" * 60)
+        logger.info("DTYPE DIAGNOSTIC (pre-fix)")
+        logger.info("=" * 60)
 
-        # ── Dtype Diagnostic ──
-        trainable_dtypes = set()
+        from collections import Counter
+        trainable_dtype_counts = Counter()
+        frozen_dtype_counts = Counter()
+        bf16_trainable_params = []
+
+        for name, param in model.named_parameters():
+            dtype_str = str(param.dtype)
+            if param.requires_grad:
+                trainable_dtype_counts[dtype_str] += param.numel()
+                if param.dtype == torch.bfloat16:
+                    bf16_trainable_params.append(name)
+            else:
+                frozen_dtype_counts[dtype_str] += param.numel()
+
+        logger.info(f"Trainable param dtype counts: {dict(trainable_dtype_counts)}")
+        logger.info(f"Frozen param dtype counts: {dict(frozen_dtype_counts)}")
+        if bf16_trainable_params:
+            logger.info(f"Found {len(bf16_trainable_params)} BF16 trainable params — casting to FP16:")
+            for pname in bf16_trainable_params[:20]:  # Show first 20
+                logger.info(f"  BF16 trainable: {pname}")
+            if len(bf16_trainable_params) > 20:
+                logger.info(f"  ... and {len(bf16_trainable_params) - 20} more")
+
+        # ── Fix: cast any BF16 trainable parameters to FP16 ──
+        cast_count = 0
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.dtype == torch.bfloat16:
+                param.data = param.data.to(torch.float16)
+                cast_count += 1
+        if cast_count > 0:
+            logger.info(f"Cast {cast_count} trainable parameters from BF16 → FP16")
+
+        # Verify post-fix
+        post_fix_dtypes = Counter()
         total_trainable = 0
         for name, param in model.named_parameters():
             if param.requires_grad:
-                trainable_dtypes.add(str(param.dtype))
+                post_fix_dtypes[str(param.dtype)] += param.numel()
                 total_trainable += param.numel()
-        logger.info(f"Trainable parameters: {total_trainable:,}")
-        logger.info(f"Trainable parameter dtypes: {trainable_dtypes}")
+        logger.info(f"Post-fix trainable param dtypes: {dict(post_fix_dtypes)}")
+        logger.info(f"Total trainable parameters: {total_trainable:,}")
+        logger.info(f"Config — bf16: {config['training']['bf16']}, fp16: {config['training']['fp16']}")
+        logger.info("=" * 60)
     else:
         # Mock model for syntax testing
         model = None
@@ -164,7 +205,9 @@ def main():
                 ]
                 
                 text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-                image_inputs, video_inputs = process_vision_info(messages)
+                vision_info = process_vision_info(messages)
+                image_inputs = vision_info[0]
+                video_inputs = vision_info[1]
                 
                 texts.append(text)
                 if image_inputs:
@@ -275,6 +318,54 @@ def main():
             data_collator=QwenVLDataCollator(processor),
             callbacks=[EarlyStoppingCallback(early_stopping_patience=train_cfg.get("early_stopping_patience", 5))] if not args.smoke_test else [],
         )
+
+        # ── ONE-BATCH MANUAL GRADIENT DIAGNOSTIC ──
+        if args.smoke_test and torch.cuda.is_available():
+            logger.info("=" * 60)
+            logger.info("MANUAL FORWARD/BACKWARD DIAGNOSTIC")
+            logger.info("=" * 60)
+            try:
+                collator = QwenVLDataCollator(processor)
+                sample_batch = collator([train_ds[0]])
+                
+                # Move to device
+                for k, v in sample_batch.items():
+                    if isinstance(v, torch.Tensor):
+                        sample_batch[k] = v.to(model.device)
+                
+                # Context manager based on training args
+                if sft_config.fp16:
+                    ctx = torch.autocast(device_type='cuda', dtype=torch.float16)
+                elif sft_config.bf16:
+                    ctx = torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+                else:
+                    from contextlib import nullcontext
+                    ctx = nullcontext()
+
+                with ctx:
+                    outputs = model(**sample_batch)
+                    # We just need any scalar loss to backward
+                    loss = outputs.logits.sum()
+
+                loss.backward()
+
+                grad_dtypes = Counter()
+                for name, param in model.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        grad_dtypes[str(param.grad.dtype)] += 1
+                        if param.grad.dtype == torch.bfloat16:
+                            logger.error(f"BF16 Gradient found in: {name}, param dtype: {param.dtype}, shape: {param.shape}")
+                
+                logger.info(f"Gradient dtype counts across trainable params: {dict(grad_dtypes)}")
+                logger.info("Manual pass complete.")
+                
+                # Clear gradients so we don't mess up actual training
+                model.zero_grad()
+                
+            except Exception as e:
+                logger.error(f"Manual pass failed: {e}")
+                
+            logger.info("=" * 60)
 
         logger.info("Starting training...")
         
