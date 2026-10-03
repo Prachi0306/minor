@@ -69,6 +69,13 @@ def main():
     train_ds = load_dataset("json", data_files=config["dataset"]["train_path"], split="train")
     val_ds = load_dataset("json", data_files=config["dataset"]["val_path"], split="train")
 
+    # TRL 1.14.1 incorrectly trips a VLM check if the dataset has an 'image' column. 
+    # Rename it to 'image_path' to bypass this check cleanly.
+    if "image" in train_ds.column_names:
+        train_ds = train_ds.rename_column("image", "image_path")
+    if "image" in val_ds.column_names:
+        val_ds = val_ds.rename_column("image", "image_path")
+
     if args.smoke_test:
         logger.info("SMOKE TEST MODE: Using 2 samples.")
         train_ds = train_ds.select(range(min(2, len(train_ds))))
@@ -134,7 +141,7 @@ def main():
                 messages = [
                     {"role": "system", "content": "You are a multimodal humor classifier for Hindi/Hinglish memes. Respond with only HUMOR or NON-HUMOR."},
                     {"role": "user", "content": [
-                        {"type": "image", "image": example["image"]},
+                        {"type": "image", "image": example["image_path"]},
                         {"type": "text", "text": f"Analyze this Hindi/Hinglish meme using the image and text.\nText: {example['ocr_text']}\n\nIs this meme humorous? Respond with only HUMOR or NON-HUMOR."}
                     ]},
                     {"role": "assistant", "content": example["label"]}
@@ -213,8 +220,9 @@ def main():
         gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
         learning_rate=float(train_cfg["learning_rate"]),
         optim=train_cfg["optim"],
-        bf16=train_cfg["bf16"],
-        fp16=train_cfg["fp16"],
+        bf16=train_cfg["bf16"] if torch.cuda.is_available() else False,
+        fp16=train_cfg["fp16"] if torch.cuda.is_available() else False,
+        use_cpu=not torch.cuda.is_available(),
         eval_strategy=train_cfg["eval_strategy"],
         eval_steps=train_cfg["eval_steps"],
         save_strategy=train_cfg["save_strategy"],
