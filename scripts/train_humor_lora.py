@@ -173,7 +173,7 @@ def main():
     # ── Custom Weighted Loss Trainer ──
     # BLOCKER 2 FIX: Actually use the YAML class weights in the loss calculation.
     class WeightedTrainer(SFTTrainer):
-        def __init__(self, class_weights, processor_vocab, *args, **kwargs):
+        def __init__(self, class_weights, processor_vocab, pad_token_id, *args, **kwargs):
             super().__init__(*args, **kwargs)
             # Find the token IDs for HUMOR and NON-HUMOR
             # Qwen uses specific tokens. We will weight them directly.
@@ -181,6 +181,7 @@ def main():
             self.weight_tensor = None
             self.class_weights = class_weights
             self.processor_vocab = processor_vocab
+            self.pad_token_id = pad_token_id
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             labels = inputs.pop("labels")
@@ -201,7 +202,7 @@ def main():
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
-            loss_fct = nn.CrossEntropyLoss(weight=self.weight_tensor, ignore_index=self.processor.tokenizer.pad_token_id)
+            loss_fct = nn.CrossEntropyLoss(weight=self.weight_tensor, ignore_index=self.pad_token_id)
             loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
             
             return (loss, outputs) if return_outputs else loss
@@ -243,6 +244,7 @@ def main():
         trainer = WeightedTrainer(
             class_weights=config["dataset"].get("class_weights", {}),
             processor_vocab=processor.tokenizer.get_vocab(),
+            pad_token_id=processor.tokenizer.pad_token_id,
             model=model,
             args=sft_config,
             train_dataset=train_ds,
