@@ -136,7 +136,11 @@ def main():
         if hasattr(model, 'config') and hasattr(model.config, 'torch_dtype'):
             model.config.torch_dtype = torch.float16
             
-        model = get_peft_model(model, lora_config)
+        model = get_peft_model(
+            model,
+            lora_config,
+            autocast_adapter_dtype=False,
+        )
 
         # 2. Cast all trainable PEFT parameters to FP16 immediately (they initialize as FP32).
         #    This ensures they are FP16 in the optimizer state.
