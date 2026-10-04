@@ -12,6 +12,8 @@ import argparse
 import yaml
 import logging
 
+from collections import Counter
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -126,58 +128,22 @@ def main():
             bias=lora_cfg["bias"],
             task_type=lora_cfg["task_type"],
         )
+        # ── MINIMAL FIX FOR BF16 GRADIENTS ──
+        # 1. Force the model config to FP16. Qwen2.5-VL defaults to BF16, and PEFT's 
+        #    `autocast_adapter_dtype` hook will dynamically cast LoRA parameters to 
+        #    `model.config.torch_dtype` during the first forward pass. This prevents 
+        #    them from becoming BF16 in the optimizer.
+        if hasattr(model, 'config') and hasattr(model.config, 'torch_dtype'):
+            model.config.torch_dtype = torch.float16
+            
         model = get_peft_model(model, lora_config)
-        # ── Comprehensive Dtype Diagnostic & Fix ──
-        # PEFT/BnB may create LoRA adapters in BF16 (from model config default)
-        # even when torch_dtype=float16 is passed. The FP16 GradScaler requires
-        # all trainable gradients to be FP16 or FP32 — BF16 is not supported.
-        logger.info("=" * 60)
-        logger.info("DTYPE DIAGNOSTIC (pre-fix)")
-        logger.info("=" * 60)
 
-        from collections import Counter
-        trainable_dtype_counts = Counter()
-        frozen_dtype_counts = Counter()
-        bf16_trainable_params = []
-
+        # 2. Cast all trainable PEFT parameters to FP16 immediately (they initialize as FP32).
+        #    This ensures they are FP16 in the optimizer state.
         for name, param in model.named_parameters():
-            dtype_str = str(param.dtype)
             if param.requires_grad:
-                trainable_dtype_counts[dtype_str] += param.numel()
-                if param.dtype == torch.bfloat16:
-                    bf16_trainable_params.append(name)
-            else:
-                frozen_dtype_counts[dtype_str] += param.numel()
-
-        logger.info(f"Trainable param dtype counts: {dict(trainable_dtype_counts)}")
-        logger.info(f"Frozen param dtype counts: {dict(frozen_dtype_counts)}")
-        if bf16_trainable_params:
-            logger.info(f"Found {len(bf16_trainable_params)} BF16 trainable params — casting to FP16:")
-            for pname in bf16_trainable_params[:20]:  # Show first 20
-                logger.info(f"  BF16 trainable: {pname}")
-            if len(bf16_trainable_params) > 20:
-                logger.info(f"  ... and {len(bf16_trainable_params) - 20} more")
-
-        # ── Fix: cast any BF16 trainable parameters to FP16 ──
-        cast_count = 0
-        for name, param in model.named_parameters():
-            if param.requires_grad and param.dtype == torch.bfloat16:
                 param.data = param.data.to(torch.float16)
-                cast_count += 1
-        if cast_count > 0:
-            logger.info(f"Cast {cast_count} trainable parameters from BF16 → FP16")
 
-        # Verify post-fix
-        post_fix_dtypes = Counter()
-        total_trainable = 0
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                post_fix_dtypes[str(param.dtype)] += param.numel()
-                total_trainable += param.numel()
-        logger.info(f"Post-fix trainable param dtypes: {dict(post_fix_dtypes)}")
-        logger.info(f"Total trainable parameters: {total_trainable:,}")
-        logger.info(f"Config — bf16: {config['training']['bf16']}, fp16: {config['training']['fp16']}")
-        logger.info("=" * 60)
     else:
         # Mock model for syntax testing
         model = None
@@ -376,15 +342,24 @@ def main():
                 else:
                     from contextlib import nullcontext
                     ctx = nullcontext()
-
-                with ctx:
+                accelerator = trainer.accelerator
+                # Run a minimal forward and backward pass
+                logger.info("Running dummy forward and backward pass...")
+                sample_batch = {
+                    k: v.to(accelerator.device) if hasattr(v, "to") else v
+                    for k, v in sample_batch.items()
+                }
+                
+                # SFTTrainer compute_loss does not automatically autocast if called directly
+                # but Accelerator handles it during trainer.train(). We wrap it just to be safe.
+                with accelerator.autocast():
                     loss = trainer.compute_loss(model, sample_batch)
                 
                 loss.backward()
 
                 # 6. Inspect EVERY parameter in optimizer
                 logger.info("-" * 40)
-                logger.info("OPTIMIZER PARAMETER INSPECTION")
+                logger.info("FINAL OPTIMIZER PARAMETER INSPECTION")
                 logger.info("-" * 40)
                 
                 opt_param_dtypes = Counter()
