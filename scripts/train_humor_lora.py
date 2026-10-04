@@ -128,11 +128,13 @@ def main():
             bias=lora_cfg["bias"],
             task_type=lora_cfg["task_type"],
         )
-        # ── MINIMAL FIX FOR BF16 GRADIENTS ──
-        # 1. Force the model config to FP16. Qwen2.5-VL defaults to BF16, and PEFT's 
-        #    `autocast_adapter_dtype` hook will dynamically cast LoRA parameters to 
-        #    `model.config.torch_dtype` during the first forward pass. This prevents 
-        #    them from becoming BF16 in the optimizer.
+        # ── FIX FOR BF16 GRADIENTS ON T4 ──
+        # The Trainer/Accelerate mixed-precision pipeline forcibly converts LoRA
+        # adapter parameters to BF16 during model preparation, regardless of
+        # explicit FP16 casts or autocast_adapter_dtype=False.  Since the T4
+        # GradScaler does not support BF16 gradients, we disable Trainer AMP
+        # entirely and let LoRA parameters train in FP32.  The 4-bit base model
+        # remains quantized, so memory usage is unchanged.
         if hasattr(model, 'config') and hasattr(model.config, 'torch_dtype'):
             model.config.torch_dtype = torch.float16
             
@@ -141,12 +143,6 @@ def main():
             lora_config,
             autocast_adapter_dtype=False,
         )
-
-        # 2. Cast all trainable PEFT parameters to FP16 immediately (they initialize as FP32).
-        #    This ensures they are FP16 in the optimizer state.
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                param.data = param.data.to(torch.float16)
 
     else:
         # Mock model for syntax testing
@@ -252,8 +248,11 @@ def main():
         gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
         learning_rate=float(train_cfg["learning_rate"]),
         optim=train_cfg["optim"],
-        bf16=train_cfg["bf16"] if torch.cuda.is_available() else False,
-        fp16=train_cfg["fp16"] if torch.cuda.is_available() else False,
+        # T4 FIX: Disable Trainer AMP entirely.  The Accelerate mixed-precision
+        # pipeline converts LoRA params to BF16 (unsupported by T4 GradScaler).
+        # LoRA trains in FP32; 4-bit base model stays quantized.
+        bf16=False,
+        fp16=False,
         use_cpu=not torch.cuda.is_available(),
         eval_strategy=train_cfg["eval_strategy"],
         eval_steps=train_cfg["eval_steps"],
@@ -360,6 +359,11 @@ def main():
                     loss = trainer.compute_loss(model, sample_batch)
                 
                 loss.backward()
+                
+                # 6a. Run optimizer.step() to verify full stability
+                logger.info("Running optimizer.step() to verify full stability...")
+                trainer.optimizer.step()
+                logger.info("optimizer.step() completed successfully.")
 
                 # 6. Inspect EVERY parameter in optimizer
                 logger.info("-" * 40)
