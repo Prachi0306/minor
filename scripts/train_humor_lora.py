@@ -325,6 +325,7 @@ def main():
             logger.info("EXHAUSTIVE OPTIMIZER & GRADIENT DIAGNOSTIC (PRE-TRAIN)")
             logger.info("=" * 80)
             
+            diagnostic_passed = False
             try:
                 # 1. Create optimizer exactly as Trainer would
                 trainer.create_optimizer()
@@ -340,12 +341,32 @@ def main():
                 logger.info(f"accelerator.mixed_precision: {trainer.accelerator.mixed_precision}")
                 logger.info(f"trainer.args.fp16: {trainer.args.fp16}")
                 logger.info(f"trainer.args.bf16: {trainer.args.bf16}")
-                logger.info(f"scaler class: {trainer.scaler.__class__.__name__ if trainer.scaler else 'None'}")
                 logger.info(f"bnb_4bit_compute_dtype: {bnb_config.bnb_4bit_compute_dtype if bnb_config else 'None'}")
+                
+                # Find scaler safely via introspection
+                scaler_info = "NOT FOUND"
+                for attr_name in ["scaler", "grad_scaler", "gradient_scaler"]:
+                    if hasattr(trainer, attr_name) and getattr(trainer, attr_name) is not None:
+                        scaler_info = f"trainer.{attr_name} = {getattr(trainer, attr_name).__class__.__name__}"
+                        break
+                if scaler_info == "NOT FOUND":
+                    acc = trainer.accelerator
+                    if hasattr(acc, "scaler") and acc.scaler is not None:
+                        scaler_info = f"accelerator.scaler = {acc.scaler.__class__.__name__}"
+                    elif hasattr(acc, "gradient_state"):
+                        scaler_info = f"accelerator.gradient_state = {acc.gradient_state.__class__.__name__}"
+                logger.info(f"GradScaler: {scaler_info}")
+                
                 if hasattr(torch, 'get_autocast_gpu_dtype'):
                     logger.info(f"torch.get_autocast_gpu_dtype(): {torch.get_autocast_gpu_dtype()}")
                 
-                # 4. Run exact forward and backward pass
+                # 4. Model dtype counts
+                all_param_dtypes = Counter()
+                for n, p in model.named_parameters():
+                    all_param_dtypes[str(p.dtype)] += 1
+                logger.info(f"Model parameter dtype counts (by count): {dict(all_param_dtypes)}")
+                
+                # 5. Run exact forward and backward pass
                 model.train()
                 
                 if sft_config.fp16:
@@ -361,7 +382,7 @@ def main():
                 
                 loss.backward()
 
-                # 5. Inspect EVERY parameter in optimizer
+                # 6. Inspect EVERY parameter in optimizer
                 logger.info("-" * 40)
                 logger.info("OPTIMIZER PARAMETER INSPECTION")
                 logger.info("-" * 40)
@@ -369,19 +390,20 @@ def main():
                 opt_param_dtypes = Counter()
                 opt_grad_dtypes = Counter()
                 combo_counts = Counter()
+                bf16_grad_params = []
                 
                 logger.info(f"Optimizer class: {trainer.optimizer.__class__.__name__}")
                 logger.info(f"Number of parameter groups: {len(trainer.optimizer.param_groups)}")
                 
-                # We need a mapping from param object to name to print names
-                param_to_name = {p: n for n, p in model.named_parameters()}
-                
-                first_bf16_grad = None
+                # Mapping from param tensor id to name
+                param_to_name = {}
+                for n, p in model.named_parameters():
+                    param_to_name[id(p)] = n
 
                 for i, group in enumerate(trainer.optimizer.param_groups):
                     logger.info(f"Group {i} size: {len(group['params'])}")
                     for p in group["params"]:
-                        name = param_to_name.get(p, "UNKNOWN_PARAM")
+                        name = param_to_name.get(id(p), "UNKNOWN_PARAM")
                         
                         p_dtype = str(p.dtype)
                         opt_param_dtypes[p_dtype] += 1
@@ -398,11 +420,10 @@ def main():
                         if p.grad is not None:
                             g_dtype = str(p.grad.dtype)
                             opt_grad_dtypes[g_dtype] += 1
-                            combo_counts[f"{p_dtype} parameter + {g_dtype} gradient"] += 1
+                            combo_counts[f"{p_dtype} param + {g_dtype} grad"] += 1
                             
                             if p.grad.dtype == torch.bfloat16:
-                                if first_bf16_grad is None:
-                                    first_bf16_grad = name
+                                bf16_grad_params.append(name)
                                 logger.error(f"BF16 GRADIENT -> Name: {name}, Param Dtype: {p_dtype}, Grad Shape: {p.grad.shape}, Is LoRA: {is_lora}, Is 4bit: {is_4bit}")
                         else:
                             logger.warning(f"Parameter in optimizer has NO gradient: {name}")
@@ -413,19 +434,26 @@ def main():
                 logger.info(f"Optimizer parameter dtypes: {dict(opt_param_dtypes)}")
                 logger.info(f"Optimizer gradient dtypes: {dict(opt_grad_dtypes)}")
                 for combo, count in combo_counts.items():
-                    logger.info(f"{combo}: {count}")
+                    logger.info(f"  {combo}: {count}")
                 
-                if first_bf16_grad:
-                    logger.error(f"FIRST PARAMETER WITH BF16 GRADIENT: {first_bf16_grad}")
+                if bf16_grad_params:
+                    logger.error(f"FIRST BF16 GRADIENT PARAMETER: {bf16_grad_params[0]}")
+                    logger.error(f"ALL BF16 GRADIENT PARAMETERS ({len(bf16_grad_params)} total):")
+                    for pname in bf16_grad_params:
+                        logger.error(f"  {pname}")
                 else:
                     logger.info("NO BF16 GRADIENTS FOUND IN OPTIMIZER.")
                 
-                # Clear gradients so we don't mess up actual training
+                # Clear gradients
                 model.zero_grad()
                 trainer.optimizer.zero_grad()
                 
+                diagnostic_passed = True
+                
             except Exception as e:
                 logger.error(f"Exhaustive diagnostic failed: {e}", exc_info=True)
+                logger.error("DIAGNOSTIC FAILURE IS A HARD STOP. Exiting.")
+                sys.exit(1)
                 
             logger.info("=" * 80)
 
