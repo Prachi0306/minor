@@ -46,3 +46,7 @@ experiments/*
 
 # Other
 .pytest_cache/
+
+data/processed.zip
+data/memotion3_processed/data/processed.zip
+data/memotion3_processed/
